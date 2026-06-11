@@ -44,16 +44,37 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ── 1. Зависимости системы ───────────────────────────────────────────────────
+# Определяем версию python для правильного имени venv-пакета (python3.12-venv и т.п.)
+PYVER="$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo '')"
+
 NEED_PKGS=()
-command -v python3 >/dev/null || NEED_PKGS+=(python3 python3-venv)
-python3 -m venv --help >/dev/null 2>&1 || NEED_PKGS+=(python3-venv)
-command -v ipset >/dev/null || NEED_PKGS+=(ipset)
+command -v python3 >/dev/null || NEED_PKGS+=(python3)
+# venv нужен ВСЕГДА: проверяем, что ensurepip реально доступен (а не просто `venv --help`)
+if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+    NEED_PKGS+=(python3-venv)
+    [[ -n "$PYVER" ]] && NEED_PKGS+=("python${PYVER}-venv")
+fi
+command -v pip3 >/dev/null || python3 -c 'import pip' >/dev/null 2>&1 || NEED_PKGS+=(python3-pip)
+command -v ipset    >/dev/null || NEED_PKGS+=(ipset)
 command -v iptables >/dev/null || NEED_PKGS+=(iptables)
-command -v openssl >/dev/null || NEED_PKGS+=(openssl)
+command -v openssl  >/dev/null || NEED_PKGS+=(openssl)
+command -v curl     >/dev/null || NEED_PKGS+=(curl)
+
 if (( ${#NEED_PKGS[@]} )); then
     echo "→ Ставлю пакеты: ${NEED_PKGS[*]}"
-    apt-get update -qq && apt-get install -y -qq "${NEED_PKGS[@]}" || \
-        echo "⚠️ Не удалось поставить: ${NEED_PKGS[*]} — поставь вручную (ipset желателен)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    # ставим по одному, чтобы отсутствие одного пакета (напр. версии venv) не валило остальные
+    for pkg in "${NEED_PKGS[@]}"; do
+        apt-get install -y -qq "$pkg" || echo "⚠️ Не удалось поставить $pkg (пробую дальше)"
+    done
+fi
+
+# Контрольная проверка venv — без него дальше нет смысла
+if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+    echo "❌ python venv недоступен. Поставь вручную и перезапусти:" >&2
+    echo "   apt install -y python${PYVER:-3}-venv && sudo bash install.sh" >&2
+    exit 1
 fi
 
 # ── 2. .env: из аргументов окружения или существующий файл ───────────────────
