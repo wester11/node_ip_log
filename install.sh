@@ -8,10 +8,12 @@
 #
 #   sudo CENTRAL_API_URL=https://netvoid.ru \
 #        REGISTRATION_SECRET=<общий секрет> \
+#        ALLOW_IPS=43.245.225.14,82.24.110.234 \
 #        bash install.sh
 #
 #   NEVER_BLOCK по умолчанию = 43.245.225.14,82.24.110.234 (IP бота/панели).
-#   Переопределить можно своим: NEVER_BLOCK=1.2.3.4,5.6.7.8
+#   ALLOW_IPS — кто может стучаться в порт агента (файрвол). Остальным закрыто.
+#             Можно несколько через запятую. BOT_IP — старый синоним для одного IP.
 #
 #   • AGENT_TOKEN генерируется автоматически (openssl rand -hex 32)
 #   • NODE_NAME по умолчанию = hostname (переопределить: NODE_NAME=fi-node-1)
@@ -105,15 +107,29 @@ systemctl daemon-reload
 systemctl enable void-node-agent
 systemctl restart void-node-agent
 
-# ── 5. Файрвол (опционально, если передан BOT_IP и есть ufw) ─────────────────
+# ── 5. Файрвол (опц.): пускать к порту агента ТОЛЬКО доверенные IP ────────────
+# ALLOW_IPS — список IP через запятую/пробел (бот, панель Remnawave и т.п.).
+# Для обратной совместимости BOT_IP тоже учитывается.
 PORT="$(grep -E '^AGENT_PORT=' "$APP_DIR/.env" | cut -d= -f2 || true)"
 PORT="${PORT:-8765}"
-if [[ -n "${BOT_IP:-}" ]] && command -v ufw >/dev/null; then
-    echo "→ Настраиваю ufw: порт $PORT только для $BOT_IP"
-    ufw allow from "$BOT_IP" to any port "$PORT" proto tcp >/dev/null || true
+ALLOW_LIST="${ALLOW_IPS:-${BOT_IP:-}}"
+if [[ -n "$ALLOW_LIST" ]] && command -v ufw >/dev/null; then
+    echo "→ Настраиваю ufw: порт $PORT только для: $ALLOW_LIST"
+    # сначала разрешаем доверенным, потом запрещаем всем остальным
+    for ip in ${ALLOW_LIST//,/ }; do
+        [[ -z "$ip" ]] && continue
+        ufw allow from "$ip" to any port "$PORT" proto tcp >/dev/null || true
+        echo "   ✓ allow $ip"
+    done
     ufw deny "$PORT"/tcp >/dev/null || true
-elif [[ -n "${BOT_IP:-}" ]]; then
-    echo "⚠️ BOT_IP задан, но ufw не найден — закрой порт $PORT файрволом вручную"
+    echo "   ✓ deny остальным"
+elif [[ -n "$ALLOW_LIST" ]]; then
+    echo "⚠️ ALLOW_IPS/BOT_IP заданы, но ufw не найден — закрой порт $PORT вручную:"
+    for ip in ${ALLOW_LIST//,/ }; do
+        [[ -z "$ip" ]] && continue
+        echo "      ufw allow from $ip to any port $PORT proto tcp"
+    done
+    echo "      ufw deny $PORT/tcp"
 fi
 
 sleep 2
