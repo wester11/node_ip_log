@@ -1,0 +1,21 @@
+[Unit]
+Description=VOID Node Agent (IP blocking via iptables)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/void-node-agent
+EnvironmentFile=/opt/void-node-agent/.env
+ExecStart=/opt/void-node-agent/venv/bin/python /opt/void-node-agent/main.py
+Restart=always
+RestartSec=5
+# лёгкие лимиты, чтобы не мешать VPN-нагрузке
+MemoryMax=150M
+CPUWeight=50
+Nice=10
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

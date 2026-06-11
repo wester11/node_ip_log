@@ -1,0 +1,21 @@
+# секреты — НИКОГДА не коммитить
+.env
+*.env
+!.env.example
+
+# state агента
+state.json
+/var/lib/void-node-agent/
+
+# python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+
+# os / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,4 @@
+# void-node-agent (на ноде)
+fastapi>=0.110,<1.0
+uvicorn>=0.29,<1.0
+requests>=2.31
