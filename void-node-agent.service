@@ -8,6 +8,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/void-node-agent
 EnvironmentFile=/opt/void-node-agent/.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/void-node-agent/venv/bin/python /opt/void-node-agent/main.py
 Restart=always
 RestartSec=5
