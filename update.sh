@@ -13,6 +13,11 @@ fi
 cp "$SRC_DIR"/main.py "$SRC_DIR"/startup.py "$SRC_DIR"/requirements.txt "$APP_DIR/"
 "$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
 cp "$SRC_DIR/void-node-agent.service" /etc/systemd/system/void-node-agent.service
+install -m 700 "$SRC_DIR/void-node-agent-firewall.sh" /usr/local/sbin/void-node-agent-firewall
+install -m 644 "$SRC_DIR/void-node-agent-firewall.service" /etc/systemd/system/void-node-agent-firewall.service
 systemctl daemon-reload
+if [[ -f /etc/default/void-node-agent-firewall ]]; then
+    systemctl enable --now void-node-agent-firewall
+fi
 systemctl restart void-node-agent
 echo "✅ Обновлено и перезапущено."

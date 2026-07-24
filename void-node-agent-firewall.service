@@ -1,0 +1,13 @@
+[Unit]
+Description=VOID Node Agent API firewall
+Wants=network-online.target
+After=network-online.target
+Before=void-node-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/void-node-agent-firewall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

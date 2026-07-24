@@ -19,7 +19,7 @@
 #
 #   • AGENT_TOKEN генерируется автоматически (openssl rand -hex 32)
 #   • NODE_NAME по умолчанию = hostname (переопределить: NODE_NAME=fi-node-1)
-#   • SSH-порт разрешается в ufw автоматически — лока по SSH не будет
+#   • Доступ к агенту закрывается отдельной iptables-цепочкой — VPN и SSH не затрагиваются
 #
 # Вариант Б (классика) — заполнить .env руками:
 #
@@ -31,7 +31,7 @@
 #   2. Создаёт .env (вариант А) или берёт существующий (вариант Б)
 #   3. Копирует файлы в /opt/void-node-agent, создаёт venv, ставит зависимости
 #   4. Ставит systemd-сервис, включает автозапуск
-#   5. (опц.) настраивает ufw для порта агента
+#   5. (опц.) настраивает и сохраняет iptables-правило для порта агента
 #   Дальше агент сам регистрируется в боте и восстанавливает правила после ребута.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -134,9 +134,10 @@ fi
 # ── 4. systemd ───────────────────────────────────────────────────────────────
 echo "→ Ставлю systemd-сервис"
 cp "$SRC_DIR/void-node-agent.service" /etc/systemd/system/void-node-agent.service
+install -m 700 "$SRC_DIR/void-node-agent-firewall.sh" /usr/local/sbin/void-node-agent-firewall
+install -m 644 "$SRC_DIR/void-node-agent-firewall.service" /etc/systemd/system/void-node-agent-firewall.service
 systemctl daemon-reload
 systemctl enable void-node-agent
-systemctl restart void-node-agent
 
 # ── 5. Файрвол (опц.): пускать к порту агента ТОЛЬКО доверенные IP ────────────
 # ALLOW_IPS — список IP через запятую/пробел (бот, панель Remnawave и т.п.).
@@ -144,30 +145,21 @@ systemctl restart void-node-agent
 PORT="$(grep -E '^AGENT_PORT=' "$APP_DIR/.env" | cut -d= -f2 || true)"
 PORT="${PORT:-8765}"
 ALLOW_LIST="${ALLOW_IPS:-${BOT_IP:-}}"
-if [[ -n "$ALLOW_LIST" ]] && command -v ufw >/dev/null; then
-    echo "→ Настраиваю ufw: порт $PORT только для: $ALLOW_LIST"
-    # КРИТИЧНО: сначала разрешаем SSH, чтобы файрвол не отрезал доступ к серверу.
-    # Определяем актуальный SSH-порт (sshd_config), по умолчанию 22.
-    SSH_PORT="$(grep -ahsiE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | awk '{print $2}' | head -1)"
-    SSH_PORT="${SSH_PORT:-22}"
-    ufw allow "$SSH_PORT"/tcp >/dev/null 2>&1 || true
-    echo "   ✓ allow SSH ($SSH_PORT) — чтобы не потерять доступ"
-    # затем разрешаем доверенным IP порт агента и запрещаем его всем остальным
-    for ip in ${ALLOW_LIST//,/ }; do
-        [[ -z "$ip" ]] && continue
-        ufw allow from "$ip" to any port "$PORT" proto tcp >/dev/null || true
-        echo "   ✓ allow $ip → $PORT"
-    done
-    ufw deny "$PORT"/tcp >/dev/null || true
-    echo "   ✓ deny порт $PORT остальным"
+if [[ -n "$ALLOW_LIST" ]] && command -v iptables >/dev/null; then
+    echo "→ Настраиваю iptables: порт $PORT только для: $ALLOW_LIST"
+    {
+        printf 'AGENT_PORT=%q\n' "$PORT"
+        printf 'ALLOW_IPS=%q\n' "$ALLOW_LIST"
+    } > /etc/default/void-node-agent-firewall
+    chmod 600 /etc/default/void-node-agent-firewall
+    systemctl enable void-node-agent-firewall
+    systemctl restart void-node-agent-firewall
+    echo "   ✓ правило сохранено и будет применяться после перезагрузки"
 elif [[ -n "$ALLOW_LIST" ]]; then
-    echo "⚠️ ALLOW_IPS/BOT_IP заданы, но ufw не найден — закрой порт $PORT вручную:"
-    for ip in ${ALLOW_LIST//,/ }; do
-        [[ -z "$ip" ]] && continue
-        echo "      ufw allow from $ip to any port $PORT proto tcp"
-    done
-    echo "      ufw deny $PORT/tcp"
+    echo "⚠️ ALLOW_IPS/BOT_IP заданы, но iptables не найден — закрой порт $PORT вручную."
 fi
+
+systemctl restart void-node-agent
 
 sleep 2
 systemctl --no-pager -l status void-node-agent | head -12 || true
