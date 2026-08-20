@@ -1,176 +1,88 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────────────────
-# VOID Node Agent — установка на ноду ОДНОЙ командой (systemd, без Docker).
-#
-# Репозиторий: https://github.com/wester11/node_ip_log
-#
-# Вариант А (рекомендуется) — всё в одной команде, .env создаётся сам.
-# IP подставляешь свои ПРИ УСТАНОВКЕ (в репозитории их нет):
-#
-#   sudo CENTRAL_API_URL=https://netvoid.ru \
-#        REGISTRATION_SECRET=<общий секрет> \
-#        ALLOW_IPS=<IP_бота>,<IP_панели> \
-#        bash install.sh
-#
-#   ALLOW_IPS — кто может стучаться в порт агента (файрвол). Остальным закрыто.
-#             Можно несколько через запятую. BOT_IP — синоним для одного IP.
-#   NEVER_BLOCK — IP, которые агент никогда не банит. Если не задан, берётся
-#             из ALLOW_IPS (бот/панель и так не должны баниться).
-#
-#   • AGENT_TOKEN генерируется автоматически (openssl rand -hex 32)
-#   • NODE_NAME по умолчанию = hostname (переопределить: NODE_NAME=fi-node-1)
-#   • Доступ к агенту закрывается отдельной iptables-цепочкой — VPN и SSH не затрагиваются
-#
-# Вариант Б (классика) — заполнить .env руками:
-#
-#   cp .env.example .env && nano .env
-#   sudo bash install.sh
-#
-# Что делает скрипт:
-#   1. Ставит python3/venv/ipset/iptables (если нет)
-#   2. Создаёт .env (вариант А) или берёт существующий (вариант Б)
-#   3. Копирует файлы в /opt/void-node-agent, создаёт venv, ставит зависимости
-#   4. Ставит systemd-сервис, включает автозапуск
-#   5. (опц.) настраивает и сохраняет iptables-правило для порта агента
-#   Дальше агент сам регистрируется в боте и восстанавливает правила после ребута.
-# ─────────────────────────────────────────────────────────────────────────────
+# VOID Node Agent v2 — outbound HTTPS management, no public agent port.
 set -euo pipefail
+umask 077
 
 APP_DIR=/opt/void-node-agent
+STATE_DIR=/var/lib/void-node-agent
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+CENTRAL_API_URL="${CENTRAL_API_URL:-https://netvoid.ru}"
+NODE_NAME="${NODE_NAME:-$(hostname -s)}"
 
 if [[ $EUID -ne 0 ]]; then
-    echo "Запусти от root: sudo bash install.sh" >&2
+    echo "[VOID] Run as root: sudo env VOID_NODE_ENROLLMENT_CODE=... bash install.sh" >&2
+    exit 1
+fi
+if [[ -z "${VOID_NODE_ENROLLMENT_CODE:-}" ]]; then
+    echo "[VOID] ERROR: VOID_NODE_ENROLLMENT_CODE is required." >&2
+    echo "[VOID] Generate a short-lived code in the VOID admin panel or with /nodecode." >&2
+    exit 1
+fi
+if [[ "$CENTRAL_API_URL" != https://* ]]; then
+    echo "[VOID] ERROR: CENTRAL_API_URL must use HTTPS." >&2
+    exit 1
+fi
+if [[ ! "$NODE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
+    echo "[VOID] ERROR: invalid NODE_NAME." >&2
     exit 1
 fi
 
-# ── 1. Зависимости системы ───────────────────────────────────────────────────
-# Определяем версию python для правильного имени venv-пакета (python3.12-venv и т.п.)
-PYVER="$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo '')"
+echo "[VOID] Installing system dependencies..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq python3 python3-venv python3-pip ipset iptables ca-certificates openssl
 
-NEED_PKGS=()
-command -v python3 >/dev/null || NEED_PKGS+=(python3)
-# venv нужен ВСЕГДА: проверяем, что ensurepip реально доступен (а не просто `venv --help`)
-if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
-    NEED_PKGS+=(python3-venv)
-    [[ -n "$PYVER" ]] && NEED_PKGS+=("python${PYVER}-venv")
-fi
-command -v pip3 >/dev/null || python3 -c 'import pip' >/dev/null 2>&1 || NEED_PKGS+=(python3-pip)
-command -v ipset    >/dev/null || NEED_PKGS+=(ipset)
-command -v iptables >/dev/null || NEED_PKGS+=(iptables)
-command -v openssl  >/dev/null || NEED_PKGS+=(openssl)
-command -v curl     >/dev/null || NEED_PKGS+=(curl)
+install -d -m 700 "$APP_DIR" "$STATE_DIR"
 
-if (( ${#NEED_PKGS[@]} )); then
-    echo "→ Ставлю пакеты: ${NEED_PKGS[*]}"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    # ставим по одному, чтобы отсутствие одного пакета (напр. версии venv) не валило остальные
-    for pkg in "${NEED_PKGS[@]}"; do
-        apt-get install -y -qq "$pkg" || echo "⚠️ Не удалось поставить $pkg (пробую дальше)"
-    done
-fi
-
-# Контрольная проверка venv — без него дальше нет смысла
-if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
-    echo "❌ python venv недоступен. Поставь вручную и перезапусти:" >&2
-    echo "   apt install -y python${PYVER:-3}-venv && sudo bash install.sh" >&2
-    exit 1
-fi
-
-# ── 2. .env: из аргументов окружения или существующий файл ───────────────────
-if [[ ! -f "$SRC_DIR/.env" ]]; then
-    if [[ -n "${REGISTRATION_SECRET:-}" && -n "${CENTRAL_API_URL:-}" ]]; then
-        NODE_NAME="${NODE_NAME:-$(hostname -s)}"
-        AGENT_TOKEN="${AGENT_TOKEN:-$(openssl rand -hex 32)}"
-        AGENT_PORT="${AGENT_PORT:-8765}"
-        echo "→ Создаю .env автоматически (NODE_NAME=$NODE_NAME)"
-        cat > "$SRC_DIR/.env" <<ENVEOF
-AGENT_TOKEN=$AGENT_TOKEN
-AGENT_PORT=$AGENT_PORT
-AGENT_HOST=0.0.0.0
-NODE_NAME=$NODE_NAME
-CENTRAL_API_URL=$CENTRAL_API_URL
-REGISTRATION_SECRET=$REGISTRATION_SECRET
-DEFAULT_TTL_HOURS=${DEFAULT_TTL_HOURS:-24}
-NEVER_BLOCK=${NEVER_BLOCK:-${ALLOW_IPS:-${BOT_IP:-}}}
-REGISTER_INTERVAL_MIN=${REGISTER_INTERVAL_MIN:-10}
-ENVEOF
-        [[ -n "${AGENT_PUBLIC_URL:-}" ]] && echo "AGENT_PUBLIC_URL=$AGENT_PUBLIC_URL" >> "$SRC_DIR/.env"
-        chmod 600 "$SRC_DIR/.env"
-    else
-        echo "Нет .env и не переданы переменные!" >&2
-        echo "Либо: sudo CENTRAL_API_URL=... REGISTRATION_SECRET=... bash install.sh" >&2
-        echo "Либо: cp .env.example .env && nano .env && sudo bash install.sh" >&2
-        exit 1
-    fi
-else
-    echo "→ Использую существующий .env"
-fi
-
-# ── 3. Файлы + venv ──────────────────────────────────────────────────────────
-echo "→ Копирую в $APP_DIR"
-mkdir -p "$APP_DIR" /var/lib/void-node-agent
-cp "$SRC_DIR"/main.py "$SRC_DIR"/startup.py "$SRC_DIR"/requirements.txt "$APP_DIR/"
-cp "$SRC_DIR/.env" "$APP_DIR/.env"
-chmod 600 "$APP_DIR/.env"
-
-echo "→ Создаю venv и ставлю зависимости"
-# Битый venv (например, создан до установки python3.X-venv — без pip) пересоздаём
-if [[ -d "$APP_DIR/venv" && ! -x "$APP_DIR/venv/bin/pip" ]]; then
-    echo "   (venv без pip — пересоздаю)"
+if [[ ! -x "$APP_DIR/venv/bin/pip" ]]; then
     rm -rf "$APP_DIR/venv"
-fi
-if [[ ! -d "$APP_DIR/venv" ]]; then
     python3 -m venv "$APP_DIR/venv"
 fi
-if [[ ! -x "$APP_DIR/venv/bin/pip" ]]; then
-    echo "❌ venv создан без pip. Поставь python$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')-venv и перезапусти install.sh" >&2
+"$APP_DIR/venv/bin/pip" install -q --upgrade pip
+"$APP_DIR/venv/bin/pip" install -q -r "$SRC_DIR/requirements.txt"
+
+echo "[VOID] Exchanging the one-time code for this node's private identity..."
+(
+    cd "$SRC_DIR"
+    CENTRAL_API_URL="$CENTRAL_API_URL" NODE_NAME="$NODE_NAME" \
+        VOID_NODE_ENROLLMENT_CODE="$VOID_NODE_ENROLLMENT_CODE" \
+        "$APP_DIR/venv/bin/python" "$SRC_DIR/startup.py"
+)
+
+# Only replace the running installation after enrollment succeeded.
+install -m 600 "$SRC_DIR/main.py" "$SRC_DIR/startup.py" "$SRC_DIR/secure_channel.py" "$APP_DIR/"
+install -m 600 "$SRC_DIR/requirements.txt" "$APP_DIR/requirements.txt"
+
+# The one-time code is intentionally never written to disk.
+install -m 600 /dev/null "$APP_DIR/.env"
+{
+    printf 'CENTRAL_API_URL=%s\n' "$CENTRAL_API_URL"
+    printf 'NODE_NAME=%s\n' "$NODE_NAME"
+    printf 'AGENT_HOST=127.0.0.1\n'
+    printf 'AGENT_PORT=8765\n'
+    printf 'AGENT_TOKEN=%s\n' "$(openssl rand -hex 32)"
+    printf 'DEFAULT_TTL_HOURS=%s\n' "${DEFAULT_TTL_HOURS:-24}"
+    printf 'NEVER_BLOCK=%s\n' "${NEVER_BLOCK:-}"
+} > "$APP_DIR/.env"
+chmod 600 "$APP_DIR/.env"
+
+install -m 644 "$SRC_DIR/void-node-agent.service" /etc/systemd/system/void-node-agent.service
+
+# Remove the legacy public-port firewall unit. v2 listens only on loopback.
+systemctl disable --now void-node-agent-firewall.service >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/void-node-agent-firewall.service \
+      /usr/local/sbin/void-node-agent-firewall \
+      /etc/default/void-node-agent-firewall
+
+systemctl daemon-reload
+systemctl enable void-node-agent >/dev/null
+systemctl restart void-node-agent
+sleep 2
+if ! systemctl is-active --quiet void-node-agent; then
+    echo "[VOID] ERROR: service did not start. Check: journalctl -u void-node-agent -n 100" >&2
     exit 1
 fi
-"$APP_DIR/venv/bin/pip" install -q --upgrade pip
-"$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
 
-# ── 4. systemd ───────────────────────────────────────────────────────────────
-echo "→ Ставлю systemd-сервис"
-cp "$SRC_DIR/void-node-agent.service" /etc/systemd/system/void-node-agent.service
-install -m 700 "$SRC_DIR/void-node-agent-firewall.sh" /usr/local/sbin/void-node-agent-firewall
-install -m 644 "$SRC_DIR/void-node-agent-firewall.service" /etc/systemd/system/void-node-agent-firewall.service
-systemctl daemon-reload
-systemctl enable void-node-agent
-
-# ── 5. Файрвол (опц.): пускать к порту агента ТОЛЬКО доверенные IP ────────────
-# ALLOW_IPS — список IP через запятую/пробел (бот, панель Remnawave и т.п.).
-# Для обратной совместимости BOT_IP тоже учитывается.
-PORT="$(grep -E '^AGENT_PORT=' "$APP_DIR/.env" | cut -d= -f2 || true)"
-PORT="${PORT:-8765}"
-ALLOW_LIST="${ALLOW_IPS:-${BOT_IP:-}}"
-if [[ -n "$ALLOW_LIST" ]] && command -v iptables >/dev/null; then
-    echo "→ Настраиваю iptables: порт $PORT только для: $ALLOW_LIST"
-    {
-        printf 'AGENT_PORT=%q\n' "$PORT"
-        printf 'ALLOW_IPS=%q\n' "$ALLOW_LIST"
-    } > /etc/default/void-node-agent-firewall
-    chmod 600 /etc/default/void-node-agent-firewall
-    systemctl enable void-node-agent-firewall
-    systemctl restart void-node-agent-firewall
-    echo "   ✓ правило сохранено и будет применяться после перезагрузки"
-elif [[ -n "$ALLOW_LIST" ]]; then
-    echo "⚠️ ALLOW_IPS/BOT_IP заданы, но iptables не найден — закрой порт $PORT вручную."
-fi
-
-systemctl restart void-node-agent
-
-sleep 2
-systemctl --no-pager -l status void-node-agent | head -12 || true
-
-echo
-echo "✅ Готово. Агент слушает порт $PORT."
-echo "   Нода зарегистрируется в боте сама в течение минуты."
-echo "   Проверка:  curl -s -H \"X-Agent-Token: \$(grep ^AGENT_TOKEN= $APP_DIR/.env | cut -d= -f2)\" http://127.0.0.1:$PORT/health"
-echo "   Логи:      journalctl -u void-node-agent -f"
-if [[ -z "${ALLOW_IPS:-${BOT_IP:-}}" ]]; then
-    echo "   ⚠️ Файрвол не настроен (не передан ALLOW_IPS). Закрой порт вручную:"
-    echo "      ufw allow OPENSSH"
-    echo "      ufw allow from <IP_бота> to any port $PORT proto tcp && ufw deny $PORT/tcp"
-fi
+echo "[VOID] Ready. The management channel is outbound HTTPS only."
+echo "[VOID] Local diagnostics: curl -s -H \"X-Agent-Token: <local token>\" http://127.0.0.1:8765/health"
+echo "[VOID] Logs: journalctl -u void-node-agent -f"

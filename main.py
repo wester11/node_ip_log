@@ -20,13 +20,16 @@ VOID Node Agent — лёгкий FastAPI-агент для VPN-ноды.
   • TTL блокировок (фоновая чистка раз в 60 сек)
   • asyncio.Lock на все операции с iptables/state
   • Никогда не блокирует приватные/loopback адреса (защита от выстрела в ногу)
-  • Авторегистрация в центральной БД бота при старте (startup.py)
+  • Исходящий защищённый канал HTTPS без публичного управляющего порта
 """
 
 import asyncio
 import ipaddress
 import json
 import os
+import shutil
+import socket
+import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -36,7 +39,7 @@ from pydantic import BaseModel, Field
 
 # ── Конфигурация ─────────────────────────────────────────────────────────────
 AGENT_TOKEN   = os.getenv("AGENT_TOKEN", "")
-AGENT_HOST    = os.getenv("AGENT_HOST", "0.0.0.0")
+AGENT_HOST    = os.getenv("AGENT_HOST", "127.0.0.1")
 AGENT_PORT    = int(os.getenv("AGENT_PORT", "8765"))
 STATE_FILE    = os.getenv("STATE_FILE", "/var/lib/void-node-agent/state.json")
 CHAIN         = os.getenv("CHAIN_NAME", "VOID-BLOCK")
@@ -417,6 +420,114 @@ async def _ttl_loop():
         await asyncio.sleep(60)
 
 
+def _bounded_command(*command: str, timeout: int = 8) -> dict:
+    """Run a fixed diagnostic command without accepting shell input."""
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
+        )
+        output = (completed.stdout + completed.stderr).strip()[:6000]
+        return {"exit_code": completed.returncode, "output": output}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"exit_code": -1, "output": error.__class__.__name__}
+
+
+def _tcp_probe(host: str, port: int = 443) -> dict:
+    import time as _time
+
+    started = _time.monotonic()
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        address = addresses[0][4]
+        with socket.create_connection(address, timeout=5):
+            pass
+        return {
+            "ok": True,
+            "ms": round((_time.monotonic() - started) * 1000),
+            "address": str(address[0]),
+        }
+    except OSError as error:
+        return {"ok": False, "error": error.__class__.__name__}
+
+
+async def execute_secure_command(action: str, payload: dict) -> dict:
+    """Execute the central server's explicit allow-list; never a remote shell."""
+    if action == "health":
+        return {
+            "ok": True,
+            "node": os.getenv("NODE_NAME", ""),
+            "blocked_count": len(_state["blocks"]),
+            "backend": "ipset" if _HAS_IPSET else "iptables",
+            "time": _iso(_utcnow()),
+        }
+    if action == "sync":
+        async with _lock:
+            await _purge_expired()
+            stats = await _apply_state()
+        return {"ok": stats["failed"] == 0, **stats, "count": len(_state["blocks"])}
+    if action == "block_batch":
+        ips = payload.get("ips") or []
+        if not isinstance(ips, list) or len(ips) > 5000:
+            raise ValueError("invalid IP batch")
+        results = {}
+        async with _lock:
+            for raw in ips:
+                try:
+                    ip = _validate_ip(str(raw))
+                    results[ip] = await _block_one(
+                        ip,
+                        payload.get("ttl_hours"),
+                        str(payload.get("reason") or "")[:120],
+                        str(payload.get("sub_name") or "")[:255],
+                    )
+                except HTTPException:
+                    results[str(raw)[:64]] = False
+            _save_state()
+        return {"ok": all(results.values()) if results else True, "results": results}
+    if action == "unblock_batch":
+        ips = payload.get("ips") or []
+        if not isinstance(ips, list) or len(ips) > 5000:
+            raise ValueError("invalid IP batch")
+        results = {}
+        async with _lock:
+            for raw in ips:
+                value = str(raw).strip()
+                try:
+                    value = str(ipaddress.ip_address(value))
+                except ValueError:
+                    results[value[:64]] = False
+                    continue
+                results[value] = await _unblock_one(value)
+            _save_state()
+        return {"ok": True, "results": results}
+    if action == "flush":
+        async with _lock:
+            await _flush_chain()
+            count = len(_state["blocks"])
+            _state["blocks"] = {}
+            _save_state()
+        return {"ok": True, "flushed": count}
+    if action == "diagnose_telegram":
+        # Fixed, read-only probes. No payload value is ever executed.
+        return {
+            "ok": True,
+            "telegram": await asyncio.to_thread(_tcp_probe, "api.telegram.org"),
+            "telegram_web": await asyncio.to_thread(_tcp_probe, "telegram.org"),
+            "route": await asyncio.to_thread(_bounded_command, "ip", "route", "get", "1.1.1.1"),
+            "memory": await asyncio.to_thread(_bounded_command, "free", "-m"),
+            "disk": await asyncio.to_thread(_bounded_command, "df", "-h", "/"),
+            "docker": await asyncio.to_thread(
+                _bounded_command, "docker", "ps", "--format", "{{.Names}} {{.Status}}"
+            ) if shutil.which("docker") else {"exit_code": -1, "output": "docker not installed"},
+        }
+    raise ValueError("unsupported command")
+
+
 @app.on_event("startup")
 async def _startup():
     _load_state()
@@ -425,10 +536,9 @@ async def _startup():
         stats = await _apply_state()
     print(f"[agent] started: restored {stats['applied']} block(s), failed {stats['failed']}")
     asyncio.get_event_loop().create_task(_ttl_loop())
-    # Авторегистрация в центральной БД бота (если настроена)
-    if os.getenv("CENTRAL_API_URL"):
-        from startup import registration_loop
-        asyncio.get_event_loop().create_task(registration_loop())
+    from secure_channel import management_loop
+
+    asyncio.get_event_loop().create_task(management_loop(execute_secure_command))
 
 
 if __name__ == "__main__":
