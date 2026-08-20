@@ -27,7 +27,6 @@ import asyncio
 import ipaddress
 import json
 import os
-import shutil
 import socket
 import subprocess
 import tempfile
@@ -521,9 +520,7 @@ async def execute_secure_command(action: str, payload: dict) -> dict:
             "route": await asyncio.to_thread(_bounded_command, "ip", "route", "get", "1.1.1.1"),
             "memory": await asyncio.to_thread(_bounded_command, "free", "-m"),
             "disk": await asyncio.to_thread(_bounded_command, "df", "-h", "/"),
-            "docker": await asyncio.to_thread(
-                _bounded_command, "docker", "ps", "--format", "{{.Names}} {{.Status}}"
-            ) if shutil.which("docker") else {"exit_code": -1, "output": "docker not installed"},
+            "kernel": await asyncio.to_thread(_bounded_command, "uname", "-sr"),
         }
     raise ValueError("unsupported command")
 

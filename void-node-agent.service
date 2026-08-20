@@ -5,10 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=voidnode
+Group=voidnode
 WorkingDirectory=/opt/void-node-agent
 EnvironmentFile=/opt/void-node-agent/.env
 Environment=PYTHONUNBUFFERED=1
+Environment=XTABLES_LOCKFILE=/var/lib/void-node-agent/xtables.lock
 ExecStart=/opt/void-node-agent/venv/bin/python /opt/void-node-agent/main.py
 Restart=always
 RestartSec=5
@@ -27,11 +29,18 @@ ReadWritePaths=/var/lib/void-node-agent /run
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
 

@@ -15,10 +15,13 @@ if [[ ! -s /var/lib/void-node-agent/identity.json ]]; then
     exit 1
 fi
 
-install -m 600 "$SRC_DIR/main.py" "$SRC_DIR/startup.py" "$SRC_DIR/secure_channel.py" "$APP_DIR/"
-install -m 600 "$SRC_DIR/requirements.txt" "$APP_DIR/requirements.txt"
+install -o root -g voidnode -m 640 "$SRC_DIR/main.py" "$SRC_DIR/startup.py" "$SRC_DIR/secure_channel.py" "$APP_DIR/"
+install -o root -g voidnode -m 640 "$SRC_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 "$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
 install -m 644 "$SRC_DIR/void-node-agent.service" /etc/systemd/system/void-node-agent.service
+chown -R voidnode:voidnode /var/lib/void-node-agent
+chmod 700 /var/lib/void-node-agent
+chmod 600 /var/lib/void-node-agent/identity.json
 systemctl daemon-reload
 systemctl restart void-node-agent
 systemctl is-active --quiet void-node-agent

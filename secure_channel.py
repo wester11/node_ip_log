@@ -2,7 +2,7 @@
 
 The node has no public management listener. A short-lived, single-use
 enrollment code is exchanged for a unique per-node token. The token is kept
-only in a root-readable identity file and is never printed to logs.
+only in a service-user-readable identity file and is never printed to logs.
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ import requests
 AGENT_VERSION = "2.0.0"
 IDENTITY_FILE = Path(os.getenv("VOID_NODE_IDENTITY_FILE", "/var/lib/void-node-agent/identity.json"))
 CENTRAL_API_URL = os.getenv("CENTRAL_API_URL", "https://netvoid.ru").rstrip("/")
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": f"void-node-agent/{AGENT_VERSION}"})
 
 
 class SecureChannelError(RuntimeError):
@@ -68,7 +70,7 @@ def enroll_once(enrollment_code: str, node_name: str) -> dict:
     if not enrollment_code or not node_name:
         raise SecureChannelError("enrollment code and node name are required")
     try:
-        response = requests.post(
+        response = _SESSION.post(
             f"{CENTRAL_API_URL}/internal/node/v2/enroll",
             json={
                 "enrollment_code": enrollment_code,
@@ -108,7 +110,7 @@ def _headers(identity: dict) -> dict:
 
 
 def _poll(identity: dict) -> dict:
-    response = requests.post(
+    response = _SESSION.post(
         f"{identity['central_api_url']}/internal/node/v2/poll",
         headers=_headers(identity),
         json={"agent_version": AGENT_VERSION},
@@ -122,7 +124,7 @@ def _poll(identity: dict) -> dict:
 
 def _send_result(identity: dict, command_id: int, *, result: dict | None = None,
                  error: str | None = None) -> None:
-    response = requests.post(
+    response = _SESSION.post(
         f"{identity['central_api_url']}/internal/node/v2/result",
         headers=_headers(identity),
         json={
@@ -149,7 +151,13 @@ async def management_loop(executor: Callable[[str, dict], Awaitable[dict]]) -> N
                 command_id = int(command["id"])
                 try:
                     result = await executor(str(command.get("action") or ""), command.get("payload") or {})
-                    await asyncio.to_thread(_send_result, identity, command_id, result=result)
+                    if isinstance(result, dict) and result.get("ok") is False:
+                        await asyncio.to_thread(
+                            _send_result, identity, command_id, result=result,
+                            error="action returned ok=false",
+                        )
+                    else:
+                        await asyncio.to_thread(_send_result, identity, command_id, result=result)
                 except Exception as error:
                     await asyncio.to_thread(
                         _send_result, identity, command_id,

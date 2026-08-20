@@ -31,8 +31,17 @@ echo "[VOID] Installing system dependencies..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq python3 python3-venv python3-pip ipset iptables ca-certificates openssl
+if command -v modprobe >/dev/null 2>&1; then
+    modprobe ip_set >/dev/null 2>&1 || true
+    modprobe ip_set_hash_ip >/dev/null 2>&1 || true
+    modprobe xt_set >/dev/null 2>&1 || true
+fi
 
-install -d -m 700 "$APP_DIR" "$STATE_DIR"
+if ! id -u voidnode >/dev/null 2>&1; then
+    useradd --system --home-dir "$STATE_DIR" --shell /usr/sbin/nologin voidnode
+fi
+install -d -o root -g voidnode -m 750 "$APP_DIR"
+install -d -o voidnode -g voidnode -m 700 "$STATE_DIR"
 
 if [[ ! -x "$APP_DIR/venv/bin/pip" ]]; then
     rm -rf "$APP_DIR/venv"
@@ -48,13 +57,15 @@ echo "[VOID] Exchanging the one-time code for this node's private identity..."
         VOID_NODE_ENROLLMENT_CODE="$VOID_NODE_ENROLLMENT_CODE" \
         "$APP_DIR/venv/bin/python" "$SRC_DIR/startup.py"
 )
+chown voidnode:voidnode "$STATE_DIR/identity.json"
+chmod 600 "$STATE_DIR/identity.json"
 
 # Only replace the running installation after enrollment succeeded.
-install -m 600 "$SRC_DIR/main.py" "$SRC_DIR/startup.py" "$SRC_DIR/secure_channel.py" "$APP_DIR/"
-install -m 600 "$SRC_DIR/requirements.txt" "$APP_DIR/requirements.txt"
+install -o root -g voidnode -m 640 "$SRC_DIR/main.py" "$SRC_DIR/startup.py" "$SRC_DIR/secure_channel.py" "$APP_DIR/"
+install -o root -g voidnode -m 640 "$SRC_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 
 # The one-time code is intentionally never written to disk.
-install -m 600 /dev/null "$APP_DIR/.env"
+install -o voidnode -g voidnode -m 600 /dev/null "$APP_DIR/.env"
 {
     printf 'CENTRAL_API_URL=%s\n' "$CENTRAL_API_URL"
     printf 'NODE_NAME=%s\n' "$NODE_NAME"

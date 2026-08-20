@@ -12,7 +12,9 @@ installed as a hardened systemd service and normally uses 30–50 MB RAM.
 - the central database stores only its SHA-256 hash;
 - a replacement enrollment immediately invalidates the previous token;
 - remote actions are an explicit allow-list, not a shell;
-- the systemd sandbox denies privilege escalation and limits Linux capabilities;
+- the service runs as dedicated user `voidnode`, not root;
+- the systemd sandbox denies privilege escalation and grants only `CAP_NET_ADMIN`/`CAP_NET_RAW`;
+- the Docker socket is inaccessible to the agent;
 - block state and identity are atomically stored with root-only permissions.
 
 The public repository contains no node token, registration secret, database
