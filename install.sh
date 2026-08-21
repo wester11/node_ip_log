@@ -7,6 +7,12 @@ APP_DIR=/opt/void-node-agent
 STATE_DIR=/var/lib/void-node-agent
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 CENTRAL_API_URL="${CENTRAL_API_URL:-https://netvoid.ru}"
+if [[ -z "${NODE_NAME:-}" ]] && [[ -r "$APP_DIR/.env" ]]; then
+    previous_name="$(sed -n 's/^NODE_NAME=//p' "$APP_DIR/.env" | head -n 1 | tr -d '\r')"
+    if [[ "$previous_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
+        NODE_NAME="$previous_name"
+    fi
+fi
 if [[ -z "${NODE_NAME:-}" ]]; then
     node_base="$(hostname -s 2>/dev/null | tr -cd 'A-Za-z0-9_.-' | cut -c1-48)"
     node_base="${node_base:-node}"
