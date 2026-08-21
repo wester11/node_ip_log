@@ -7,7 +7,17 @@ APP_DIR=/opt/void-node-agent
 STATE_DIR=/var/lib/void-node-agent
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 CENTRAL_API_URL="${CENTRAL_API_URL:-https://netvoid.ru}"
-NODE_NAME="${NODE_NAME:-$(hostname -s)}"
+if [[ -z "${NODE_NAME:-}" ]]; then
+    node_base="$(hostname -s 2>/dev/null | tr -cd 'A-Za-z0-9_.-' | cut -c1-48)"
+    node_base="${node_base:-node}"
+    if [[ -r /etc/machine-id ]]; then
+        node_suffix="$(tr -cd 'A-Fa-f0-9' </etc/machine-id | cut -c1-8)"
+    else
+        node_suffix=""
+    fi
+    node_suffix="${node_suffix:-$(openssl rand -hex 4)}"
+    NODE_NAME="${node_base}-${node_suffix}"
+fi
 
 if [[ $EUID -ne 0 ]]; then
     echo "[VOID] Run as root: sudo env VOID_NODE_ENROLLMENT_CODE=... bash install.sh" >&2
@@ -60,7 +70,42 @@ echo "[VOID] Exchanging the one-time code for this node's private identity..."
 chown voidnode:voidnode "$STATE_DIR/identity.json"
 chmod 600 "$STATE_DIR/identity.json"
 
-# Only replace the running installation after enrollment succeeded.
+# Only replace the running installation after enrollment succeeded. Old agent
+# state and its two dedicated firewall chains are removed, while Remnawave,
+# Docker, Xray and unrelated rules remain untouched.
+systemctl stop void-node-agent.service >/dev/null 2>&1 || true
+systemctl disable --now void-node-agent-firewall.service >/dev/null 2>&1 || true
+for binary in iptables ip6tables; do
+    if command -v "$binary" >/dev/null 2>&1; then
+        for parent in INPUT FORWARD; do
+            while "$binary" -C "$parent" -j VOID-BLOCK >/dev/null 2>&1; do
+                "$binary" -D "$parent" -j VOID-BLOCK >/dev/null 2>&1 || break
+            done
+        done
+        "$binary" -F VOID-BLOCK >/dev/null 2>&1 || true
+        "$binary" -X VOID-BLOCK >/dev/null 2>&1 || true
+    fi
+done
+if command -v iptables >/dev/null 2>&1; then
+    legacy_port="$(sed -n 's/^AGENT_PORT=//p' /etc/default/void-node-agent-firewall 2>/dev/null | tr -d "'\"" | head -n 1)"
+    legacy_port="${legacy_port:-8765}"
+    if [[ "$legacy_port" =~ ^[0-9]{1,5}$ ]]; then
+        while iptables -C INPUT -p tcp --dport "$legacy_port" -j VOID-AGENT-FW >/dev/null 2>&1; do
+            iptables -D INPUT -p tcp --dport "$legacy_port" -j VOID-AGENT-FW >/dev/null 2>&1 || break
+        done
+    fi
+    iptables -F VOID-AGENT-FW >/dev/null 2>&1 || true
+    iptables -X VOID-AGENT-FW >/dev/null 2>&1 || true
+fi
+if command -v ipset >/dev/null 2>&1; then
+    ipset destroy void-block >/dev/null 2>&1 || true
+    ipset destroy void-block6 >/dev/null 2>&1 || true
+fi
+rm -f -- "$STATE_DIR/state.json" \
+    /etc/systemd/system/void-node-agent-firewall.service \
+    /usr/local/sbin/void-node-agent-firewall \
+    /etc/default/void-node-agent-firewall
+
 install -o root -g voidnode -m 640 "$SRC_DIR/main.py" "$SRC_DIR/startup.py" "$SRC_DIR/secure_channel.py" "$APP_DIR/"
 install -o root -g voidnode -m 640 "$SRC_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 
@@ -78,12 +123,6 @@ install -o voidnode -g voidnode -m 600 /dev/null "$APP_DIR/.env"
 chmod 600 "$APP_DIR/.env"
 
 install -m 644 "$SRC_DIR/void-node-agent.service" /etc/systemd/system/void-node-agent.service
-
-# Remove the legacy public-port firewall unit. v2 listens only on loopback.
-systemctl disable --now void-node-agent-firewall.service >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/void-node-agent-firewall.service \
-      /usr/local/sbin/void-node-agent-firewall \
-      /etc/default/void-node-agent-firewall
 
 systemctl daemon-reload
 systemctl enable void-node-agent >/dev/null

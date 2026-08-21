@@ -25,23 +25,31 @@ credential, private key, or infrastructure allow-list.
 Generate a one-time command in the VOID admin panel or with:
 
 ```text
-/nodecode finland-1 10
+/nodecode 10
 ```
 
 Then run the generated command on the node. Its shape is:
 
-```bash
-git clone https://github.com/wester11/node_ip_log.git && cd node_ip_log && \
-sudo env CENTRAL_API_URL='https://netvoid.ru' NODE_NAME='finland-1' \
-VOID_NODE_ENROLLMENT_CODE='vne1_...' bash install.sh
-```
+The panel returns one HTTPS bootstrap command. The node name is generated from
+its hostname and machine identity, so it does not need to be entered manually.
 
 The code is consumed once and is never saved to disk. To migrate an existing
-node, issue a replacement code in the panel or use:
+node, simply issue another one-time code in the panel or use:
 
 ```text
-/nodecode finland-1 10 replace
+/nodecode 10
 ```
+
+After successful enrollment the installer removes the previous VOID agent
+state, its old public-port rule and its dedicated firewall chains. Remnawave,
+Docker, Xray and unrelated firewall rules are not changed.
+
+## Clean removal
+
+The private admin panel also shows a pinned removal command. It deletes only
+`void-node-agent`, `/var/lib/void-node-agent` and firewall objects created by
+this project. Installed system packages are intentionally kept because other
+services may use them.
 
 ## What central management can do
 
