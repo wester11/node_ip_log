@@ -511,6 +511,18 @@ def _system_snapshot() -> dict:
     memory = _read_meminfo()
     memory_total = int(memory.get("MemTotal") or 0)
     memory_available = int(memory.get("MemAvailable") or memory.get("MemFree") or 0)
+    # Some hardened systemd/procfs combinations intentionally hide meminfo
+    # from an unprivileged service.  sysconf still exposes aggregate memory
+    # counters there; importantly, lack of either source is "unknown", not
+    # "zero RAM" and must never lower the node score.
+    if memory_total <= 0:
+        try:
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            memory_total = int(os.sysconf("SC_PHYS_PAGES")) * page_size
+            memory_available = int(os.sysconf("SC_AVPHYS_PAGES")) * page_size
+        except (OSError, ValueError, AttributeError):
+            memory_total = 0
+            memory_available = 0
     disk = shutil.disk_usage("/")
     try:
         load1, load5, load15 = os.getloadavg()
@@ -527,8 +539,8 @@ def _system_snapshot() -> dict:
         "load_5": round(load5, 2),
         "load_15": round(load15, 2),
         "cpu": _cpu_sample(),
-        "memory_total_mb": round(memory_total / 1024 / 1024),
-        "memory_available_mb": round(memory_available / 1024 / 1024),
+        "memory_total_mb": round(memory_total / 1024 / 1024) if memory_total else None,
+        "memory_available_mb": round(memory_available / 1024 / 1024) if memory_total else None,
         "memory_available_percent": round(100 * memory_available / memory_total, 1) if memory_total else None,
         "disk_free_gb": round(disk.free / 1024 / 1024 / 1024, 2),
         "disk_free_percent": round(100 * disk.free / disk.total, 1) if disk.total else None,
@@ -640,10 +652,12 @@ def _network_audit(profile: str) -> dict:
     if failed_services:
         score -= min(45, 12 * len(failed_services))
         findings.append("Недоступны сервисы: " + ", ".join(failed_services))
-    if (system.get("memory_available_percent") or 100) < 10 or int(system.get("memory_available_mb") or 0) < 256:
+    memory_percent = system.get("memory_available_percent")
+    memory_mb = system.get("memory_available_mb")
+    if (memory_percent is not None and memory_percent < 10) or (memory_mb is not None and memory_mb < 256):
         score -= 25
         findings.append("Мало свободной оперативной памяти")
-    elif (system.get("memory_available_percent") or 100) < 20:
+    elif memory_percent is not None and memory_percent < 20:
         score -= 10
         findings.append("Свободной оперативной памяти меньше 20%")
     if (system.get("disk_free_percent") or 100) < 10 or float(system.get("disk_free_gb") or 0) < 2:
