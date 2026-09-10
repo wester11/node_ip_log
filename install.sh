@@ -93,7 +93,13 @@ for binary in iptables ip6tables; do
     fi
 done
 if command -v iptables >/dev/null 2>&1; then
-    legacy_port="$(sed -n 's/^AGENT_PORT=//p' /etc/default/void-node-agent-firewall 2>/dev/null | tr -d "'\"" | head -n 1)"
+    # On a clean node this legacy file does not exist.  With `pipefail`, a
+    # failed sed inside command substitution used to abort installation here
+    # immediately after successful enrollment, before the service was made.
+    legacy_port=""
+    if [[ -r /etc/default/void-node-agent-firewall ]]; then
+        legacy_port="$(sed -n 's/^AGENT_PORT=//p' /etc/default/void-node-agent-firewall | tr -d "'\"" | head -n 1 || true)"
+    fi
     legacy_port="${legacy_port:-8765}"
     if [[ "$legacy_port" =~ ^[0-9]{1,5}$ ]]; then
         while iptables -C INPUT -p tcp --dport "$legacy_port" -j VOID-AGENT-FW >/dev/null 2>&1; do
