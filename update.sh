@@ -51,6 +51,11 @@ fi
 install -o root -g voidnode -m 640 "$SRC_DIR/main.py" "$SRC_DIR/startup.py" "$SRC_DIR/secure_channel.py" "$APP_DIR/"
 install -o root -g voidnode -m 640 "$SRC_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 "$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+# See install.sh: Python's venv may have been created with root-only mode due
+# to the installer umask.  The agent needs read/execute, never write access.
+chown -R root:voidnode "$APP_DIR/venv"
+chmod -R g+rX "$APP_DIR/venv"
+chmod -R g-w "$APP_DIR/venv"
 APP_DIR="$APP_DIR" bash "$SRC_DIR/install_geocheck.sh"
 install -m 644 "$SRC_DIR/void-node-agent.service" /etc/systemd/system/void-node-agent.service
 chown -R voidnode:voidnode /var/lib/void-node-agent

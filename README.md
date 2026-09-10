@@ -106,6 +106,10 @@ If a legacy installer completed enrollment but stopped before creating its
 local environment file, the pinned update command repairs that incomplete
 state from the node's root-only identity; it still does not consume a new code.
 
+The systemd service runs as `voidnode`; the release scripts grant that account
+read/execute access to the root-owned virtual environment only, never write
+access. The identity and local environment remain mode `0600`.
+
 ## Remnawave
 
 Remnawave Node remains in its own Docker container. This agent is a small host

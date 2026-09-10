@@ -65,6 +65,12 @@ if [[ ! -x "$APP_DIR/venv/bin/pip" ]]; then
 fi
 "$APP_DIR/venv/bin/pip" install -q --upgrade pip
 "$APP_DIR/venv/bin/pip" install -q -r "$SRC_DIR/requirements.txt"
+# The service runs as the unprivileged `voidnode` user.  `umask 077` is right
+# for generated secrets, but it also makes a freshly-created root-owned venv
+# non-executable by that service unless we grant its dedicated group read/exec.
+chown -R root:voidnode "$APP_DIR/venv"
+chmod -R g+rX "$APP_DIR/venv"
+chmod -R g-w "$APP_DIR/venv"
 
 echo "[VOID] Exchanging the one-time code for this node's private identity..."
 (
