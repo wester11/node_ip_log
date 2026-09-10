@@ -63,6 +63,15 @@ AUDIT_ENDPOINTS = (
     ("youtube_premium", "https://www.youtube.com/premium", {200, 302, 303, 401, 403, 429}),
 )
 
+# HTTP alone cannot prove that an account can use an AI service. A CDN or an
+# authentication wall may reply even from a country where the product refuses
+# the IP. The full geocheck report provides the country-level verdict.
+REGIONAL_SERVICE_CHECKS = {
+    "chatgpt": {"label": "ChatGPT", "tokens": ("chatgpt",)},
+    "gemini": {"label": "Gemini", "tokens": ("gemini",)},
+    "youtube_premium": {"label": "YouTube Premium", "tokens": ("youtube premium", "youtube_premium")},
+}
+
 _lock = asyncio.Lock()
 # state: {"blocks": {ip: {reason, sub_name, blocked_at, expires_at|null}}}
 _state: dict = {"blocks": {}}
@@ -639,6 +648,45 @@ def _compact_geocheck_report() -> dict:
     }
 
 
+def _regional_service_access(geocheck: dict) -> list[dict]:
+    """Turn full geocheck service checks into clear country-access verdicts."""
+    raw_checks = geocheck.get("stash_checks") if isinstance(geocheck, dict) else []
+    checks = raw_checks if isinstance(raw_checks, list) else []
+    result: list[dict] = []
+    for service_id, descriptor in REGIONAL_SERVICE_CHECKS.items():
+        matches: list[dict] = []
+        for item in checks:
+            if not isinstance(item, dict):
+                continue
+            searchable = " ".join(str(item.get(key) or "").lower() for key in ("id", "name", "service"))
+            if any(token in searchable for token in descriptor["tokens"]):
+                matches.append(item)
+        states = [str(item.get("state") or item.get("status") or "").lower() for item in matches]
+        if not matches:
+            availability = "unknown"
+        elif states and all(state == "available" for state in states):
+            availability = "available"
+        elif any(state == "available" for state in states):
+            availability = "partial"
+        elif any(state in {"blocked", "unavailable", "restricted"} for state in states):
+            availability = "blocked"
+        else:
+            availability = "unknown"
+        details: list[str] = []
+        for item in matches:
+            detail = str(item.get("detail") or item.get("region") or "").strip()
+            if detail and detail not in details:
+                details.append(detail[:160])
+        result.append({
+            "id": service_id,
+            "label": descriptor["label"],
+            "availability": availability,
+            "detail": " · ".join(details[:2]),
+            "checks": len(matches),
+        })
+    return result
+
+
 def _network_audit(profile: str) -> dict:
     if profile not in {"quick", "full"}:
         raise ValueError("unsupported audit profile")
@@ -646,6 +694,7 @@ def _network_audit(profile: str) -> dict:
     system = _system_snapshot()
     services = [_https_probe(name, url, expected) for name, url, expected in AUDIT_ENDPOINTS]
     geocheck = _compact_geocheck_report() if profile == "full" else {"ran": False, "reason": "quick_profile"}
+    regional_access = _regional_service_access(geocheck) if geocheck.get("ran") else []
     findings: list[str] = []
     score = 100
     failed_services = [probe["name"] for probe in services if not probe.get("reachable")]
@@ -674,6 +723,15 @@ def _network_audit(profile: str) -> dict:
         score -= 15
         findings.append("Хостер сильно отбирает CPU у VPS")
     if geocheck.get("ran"):
+        for service in regional_access:
+            if service["id"] not in {"chatgpt", "gemini"}:
+                continue
+            if service["availability"] == "blocked":
+                score -= 18
+                findings.append(f"{service['label']} недоступен из региона этого IP")
+            elif service["availability"] == "partial":
+                score -= 8
+                findings.append(f"{service['label']} доступен из региона IP не во всех вариантах")
         alerts = [item for item in geocheck.get("findings") or [] if isinstance(item, dict) and item.get("severity") in {"alert", "error"}]
         if alerts:
             score -= min(20, 5 * len(alerts))
@@ -690,6 +748,7 @@ def _network_audit(profile: str) -> dict:
         "system": system,
         "services": services,
         "geocheck": geocheck,
+        "regional_access": regional_access,
         "findings": findings[:12],
         "duration_ms": round((time.monotonic() - started) * 1000),
     }
