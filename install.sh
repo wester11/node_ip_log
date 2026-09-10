@@ -115,6 +115,10 @@ rm -f -- "$STATE_DIR/state.json" \
 install -o root -g voidnode -m 640 "$SRC_DIR/main.py" "$SRC_DIR/startup.py" "$SRC_DIR/secure_channel.py" "$APP_DIR/"
 install -o root -g voidnode -m 640 "$SRC_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 
+# The full network audit uses only this checksum-pinned optional binary. A
+# failed download leaves the agent install healthy and keeps quick audits.
+APP_DIR="$APP_DIR" bash "$SRC_DIR/install_geocheck.sh"
+
 # The one-time code is intentionally never written to disk.
 install -o voidnode -g voidnode -m 600 /dev/null "$APP_DIR/.env"
 {

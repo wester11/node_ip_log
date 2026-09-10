@@ -59,6 +59,27 @@ services may use them.
 - bounded Telegram connectivity diagnostics;
 - revoke or rotate a node identity.
 
+## Network audit
+
+The control plane can request one of two fixed diagnostics; it cannot provide
+shell commands, URLs, proxy settings or arbitrary test arguments.
+
+- **Quick audit** checks the public IPv4, DNS/HTTPS reachability of ChatGPT,
+  Gemini, OpenAI, Google AI and YouTube, plus CPU steal, load, RAM and disk.
+  It is suitable for a scheduled run.
+- **Full Geo audit** adds the checksum-pinned `geocheck` binary. Its compact
+  report includes IP reputation, region consensus, service availability and
+  route findings. It is intended for manual checks or infrequent runs.
+
+Automatic audits are off by default. The VOID panel can enable a quick audit
+once per day, once per three days, or once per week. The scheduler releases no
+more than two nodes per minute and stores its state/results in the central
+database, so restarts do not create a burst or duplicate alerts.
+
+`dpi-detector`, YABS, iperf and CPU benchmarks are intentionally not part of
+the automatic audit: they can consume a node's bandwidth/CPU and, when run on
+a foreign VPS, do not measure a Russian subscriber's ISP filtering.
+
 There is deliberately no arbitrary command execution. Full administration and
 software deployment stay on a separate SSH key channel. This prevents a panel
 bug from becoming unrestricted root access to every VPN node.
@@ -75,6 +96,11 @@ iptables -L VOID-BLOCK -n --line-numbers
 
 `update.sh` preserves `/var/lib/void-node-agent/identity.json` and
 `/var/lib/void-node-agent/state.json`.
+
+The VOID admin panel can also produce a pinned update command. It downloads
+one immutable release and runs only `update.sh`; it does not require a new
+enrollment code and does not change the node identity, block state, Remnawave,
+Docker or Xray.
 
 ## Remnawave
 

@@ -27,14 +27,17 @@ import asyncio
 import ipaddress
 import json
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+import requests
 
 # ── Конфигурация ─────────────────────────────────────────────────────────────
 AGENT_TOKEN   = os.getenv("AGENT_TOKEN", "")
@@ -46,6 +49,19 @@ DEFAULT_TTL_H = float(os.getenv("DEFAULT_TTL_HOURS", "24"))  # 0 = бессро�
 ALLOW_PRIVATE = os.getenv("ALLOW_PRIVATE", "0") == "1"
 # IP, которые нельзя блокировать никогда (через запятую): IP бота, мониторинг
 NEVER_BLOCK   = {x.strip() for x in os.getenv("NEVER_BLOCK", "").split(",") if x.strip()}
+GEOCHECK_BIN = os.getenv("GEOCHECK_BIN", "/opt/void-node-agent/bin/geocheck")
+AUDIT_USER_AGENT = "VOID-node-audit/1.0"
+
+# These targets are deliberately fixed in the agent source. The control plane
+# can select only a profile, never arbitrary URLs or shell arguments.
+AUDIT_ENDPOINTS = (
+    ("chatgpt", "https://chatgpt.com/", {200, 302, 303, 401, 403, 429}),
+    ("openai_auth", "https://auth.openai.com/", {200, 302, 303, 401, 403, 429}),
+    ("gemini", "https://gemini.google.com/", {200, 302, 303, 401, 403, 429}),
+    ("google_ai_api", "https://generativelanguage.googleapis.com/", {400, 401, 403, 404, 429}),
+    ("youtube", "https://www.youtube.com/", {200, 302, 303, 401, 403, 429}),
+    ("youtube_premium", "https://www.youtube.com/premium", {200, 302, 303, 401, 403, 429}),
+)
 
 _lock = asyncio.Lock()
 # state: {"blocks": {ip: {reason, sub_name, blocked_at, expires_at|null}}}
@@ -454,6 +470,228 @@ def _tcp_probe(host: str, port: int = 443) -> dict:
         return {"ok": False, "error": error.__class__.__name__}
 
 
+def _read_meminfo() -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, value = line.split(":", 1)
+                values[key] = int(value.strip().split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return values
+
+
+def _cpu_sample() -> dict:
+    def read() -> tuple[int, int, int]:
+        try:
+            with open("/proc/stat", encoding="utf-8") as handle:
+                fields = handle.readline().split()[1:]
+            values = [int(value) for value in fields]
+            total = sum(values)
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            steal = values[7] if len(values) > 7 else 0
+            return total, idle, steal
+        except (OSError, ValueError, IndexError):
+            return 0, 0, 0
+
+    first = read()
+    time.sleep(0.2)
+    second = read()
+    total = second[0] - first[0]
+    if total <= 0:
+        return {"usage_percent": None, "steal_percent": None}
+    return {
+        "usage_percent": round(100 * (1 - (second[1] - first[1]) / total), 1),
+        "steal_percent": round(100 * (second[2] - first[2]) / total, 1),
+    }
+
+
+def _system_snapshot() -> dict:
+    memory = _read_meminfo()
+    memory_total = int(memory.get("MemTotal") or 0)
+    memory_available = int(memory.get("MemAvailable") or memory.get("MemFree") or 0)
+    disk = shutil.disk_usage("/")
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except OSError:
+        load1 = load5 = load15 = 0.0
+    try:
+        with open("/proc/uptime", encoding="utf-8") as handle:
+            uptime_seconds = int(float(handle.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        uptime_seconds = None
+    return {
+        "cpu_count": max(1, os.cpu_count() or 1),
+        "load_1": round(load1, 2),
+        "load_5": round(load5, 2),
+        "load_15": round(load15, 2),
+        "cpu": _cpu_sample(),
+        "memory_total_mb": round(memory_total / 1024 / 1024),
+        "memory_available_mb": round(memory_available / 1024 / 1024),
+        "memory_available_percent": round(100 * memory_available / memory_total, 1) if memory_total else None,
+        "disk_free_gb": round(disk.free / 1024 / 1024 / 1024, 2),
+        "disk_free_percent": round(100 * disk.free / disk.total, 1) if disk.total else None,
+        "uptime_seconds": uptime_seconds,
+    }
+
+
+def _https_probe(name: str, url: str, expected_statuses: set[int]) -> dict:
+    started = time.monotonic()
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": AUDIT_USER_AGENT, "Accept": "text/html,application/json;q=0.9,*/*;q=0.1"},
+            timeout=(4, 12),
+            allow_redirects=True,
+            stream=True,
+        )
+        status = int(response.status_code)
+        response.close()
+        return {
+            "name": name,
+            "reachable": status in expected_statuses,
+            "http_status": status,
+            "ms": round((time.monotonic() - started) * 1000),
+        }
+    except requests.RequestException as error:
+        return {
+            "name": name,
+            "reachable": False,
+            "error": error.__class__.__name__,
+            "ms": round((time.monotonic() - started) * 1000),
+        }
+
+
+def _public_ipv4() -> str:
+    try:
+        response = requests.get(
+            "https://api.ipify.org",
+            headers={"User-Agent": AUDIT_USER_AGENT},
+            timeout=(4, 10),
+        )
+        value = response.text.strip()
+        response.close()
+        return str(ipaddress.ip_address(value)) if "." in value else ""
+    except (requests.RequestException, ValueError):
+        return ""
+
+
+def _compact_geocheck_report() -> dict:
+    """Run the checksum-pinned local binary and return a bounded JSON summary."""
+    if not os.path.isfile(GEOCHECK_BIN) or not os.access(GEOCHECK_BIN, os.X_OK):
+        return {"ran": False, "reason": "geocheck_not_installed"}
+    try:
+        completed = subprocess.run(
+            [GEOCHECK_BIN, "--json", "--quiet", "-4", "--timeout", "6", "--rounds", "1", "--max-ttl", "12"],
+            capture_output=True,
+            text=True,
+            timeout=110,
+            check=False,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"ran": False, "reason": error.__class__.__name__}
+    if completed.returncode != 0:
+        return {"ran": False, "reason": "geocheck_failed", "exit_code": completed.returncode}
+    try:
+        raw = json.loads(completed.stdout)
+    except ValueError:
+        return {"ran": False, "reason": "geocheck_invalid_json"}
+    findings = raw.get("findings") if isinstance(raw.get("findings"), list) else []
+    compact_findings = []
+    for finding in findings[:16]:
+        if isinstance(finding, dict):
+            compact_findings.append({
+                "severity": str(finding.get("severity") or "info")[:16],
+                "message": str(finding.get("message") or finding.get("detail") or "")[:240],
+            })
+        else:
+            compact_findings.append(str(finding)[:240])
+    stash = raw.get("stash_checks") if isinstance(raw.get("stash_checks"), (dict, list)) else {}
+    # A full report must remain comfortably below the central 128 KiB result
+    # limit.  Do not preserve routes/hops verbatim: the panel only needs the
+    # verdicts, while a detailed rerun can be made directly when required.
+    consensus = raw.get("consensus") if isinstance(raw.get("consensus"), dict) else {}
+    connectivity = raw.get("connectivity") if isinstance(raw.get("connectivity"), dict) else {}
+    compact_stash = stash[:24] if isinstance(stash, list) else dict(list(stash.items())[:24])
+    return {
+        "ran": True,
+        "duration_ms": int(raw.get("duration_ms") or 0),
+        "identity": raw.get("identity") if isinstance(raw.get("identity"), dict) else {},
+        "reputation": raw.get("reputation") if isinstance(raw.get("reputation"), dict) else {},
+        "consensus": {key: consensus[key] for key in list(consensus)[:16]},
+        "connectivity": {key: connectivity[key] for key in list(connectivity)[:16]},
+        "stash_checks": compact_stash,
+        "findings": compact_findings,
+    }
+
+
+def _network_audit(profile: str) -> dict:
+    if profile not in {"quick", "full"}:
+        raise ValueError("unsupported audit profile")
+    started = time.monotonic()
+    system = _system_snapshot()
+    services = [_https_probe(name, url, expected) for name, url, expected in AUDIT_ENDPOINTS]
+    geocheck = _compact_geocheck_report() if profile == "full" else {"ran": False, "reason": "quick_profile"}
+    findings: list[str] = []
+    score = 100
+    failed_services = [probe["name"] for probe in services if not probe.get("reachable")]
+    if failed_services:
+        score -= min(45, 12 * len(failed_services))
+        findings.append("Недоступны сервисы: " + ", ".join(failed_services))
+    if (system.get("memory_available_percent") or 100) < 10 or int(system.get("memory_available_mb") or 0) < 256:
+        score -= 25
+        findings.append("Мало свободной оперативной памяти")
+    elif (system.get("memory_available_percent") or 100) < 20:
+        score -= 10
+        findings.append("Свободной оперативной памяти меньше 20%")
+    if (system.get("disk_free_percent") or 100) < 10 or float(system.get("disk_free_gb") or 0) < 2:
+        score -= 25
+        findings.append("Мало свободного места на диске")
+    elif (system.get("disk_free_percent") or 100) < 20:
+        score -= 10
+        findings.append("Свободного места на диске меньше 20%")
+    cpu_count = max(1, int(system.get("cpu_count") or 1))
+    if float(system.get("load_1") or 0) / cpu_count > 2:
+        score -= 15
+        findings.append("Высокая нагрузка на процессор")
+    if float((system.get("cpu") or {}).get("steal_percent") or 0) > 10:
+        score -= 15
+        findings.append("Хостер сильно отбирает CPU у VPS")
+    if geocheck.get("ran"):
+        alerts = [item for item in geocheck.get("findings") or [] if isinstance(item, dict) and item.get("severity") in {"alert", "error"}]
+        if alerts:
+            score -= min(20, 5 * len(alerts))
+            findings.extend([str(item.get("message") or "Проблема маршрута") for item in alerts[:3]])
+    elif profile == "full":
+        findings.append("Полная геопроверка не запустилась: " + str(geocheck.get("reason") or "unknown"))
+        score -= 5
+    report = {
+        "ok": True,
+        "kind": "network_audit",
+        "profile": profile,
+        "score": max(0, score),
+        "public_ipv4": _public_ipv4(),
+        "system": system,
+        "services": services,
+        "geocheck": geocheck,
+        "findings": findings[:12],
+        "duration_ms": round((time.monotonic() - started) * 1000),
+    }
+    # The result endpoint has a 128 KiB hard ceiling.  A release change in
+    # geocheck must never turn a healthy management poll into an oversized
+    # response, so discard only optional detail as a final guardrail.
+    if len(json.dumps(report, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 96 * 1024:
+        report["geocheck"] = {
+            "ran": bool(geocheck.get("ran")),
+            "reason": str(geocheck.get("reason") or "report_compacted"),
+            "findings": (geocheck.get("findings") or [])[:6],
+        }
+        report["findings"] = (report["findings"] + ["Подробный Geo-отчёт сокращён для безопасной передачи"])[:12]
+    return report
+
+
 async def execute_secure_command(action: str, payload: dict) -> dict:
     """Execute the central server's explicit allow-list; never a remote shell."""
     if action == "health":
@@ -522,6 +760,11 @@ async def execute_secure_command(action: str, payload: dict) -> dict:
             "disk": await asyncio.to_thread(_bounded_command, "df", "-h", "/"),
             "kernel": await asyncio.to_thread(_bounded_command, "uname", "-sr"),
         }
+    if action == "network_audit":
+        # The central API may choose a preset only.  It cannot supply a host,
+        # command line, proxy or shell fragment to this privileged service.
+        profile = str(payload.get("profile") or "quick")
+        return await asyncio.to_thread(_network_audit, profile)
     raise ValueError("unsupported command")
 
 
