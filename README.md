@@ -102,6 +102,10 @@ one immutable release and runs only `update.sh`; it does not require a new
 enrollment code and does not change the node identity, block state, Remnawave,
 Docker or Xray.
 
+If a legacy installer completed enrollment but stopped before creating its
+local environment file, the pinned update command repairs that incomplete
+state from the node's root-only identity; it still does not consume a new code.
+
 ## Remnawave
 
 Remnawave Node remains in its own Docker container. This agent is a small host
