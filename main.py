@@ -800,7 +800,10 @@ def _network_audit(profile: str) -> dict:
         findings.append("Недоступны сервисы: " + ", ".join(failed_services))
     memory_percent = system.get("memory_available_percent")
     memory_mb = system.get("memory_available_mb")
-    if (memory_percent is not None and memory_percent < 10) or (memory_mb is not None and memory_mb < 256):
+    # MemAvailable already includes reclaimable page cache.  A fixed MB floor
+    # makes a healthy 2 GiB VPS look critical even when it still has 12–15%
+    # available memory, so use the percentage whenever the kernel provides it.
+    if (memory_percent is not None and memory_percent < 10) or (memory_percent is None and memory_mb is not None and memory_mb < 256):
         score -= 25
         findings.append("Мало свободной оперативной памяти")
     elif memory_percent is not None and memory_percent < 20:
