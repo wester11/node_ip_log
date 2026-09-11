@@ -76,6 +76,13 @@ REALITY_TLS_CANDIDATES = (
     "www.oracle.com", "www.ibm.com", "www.cisco.com", "www.intel.com",
     "www.nvidia.com", "www.dell.com", "www.adobe.com", "www.samsung.com",
     "www.nike.com", "www.bbc.com", "www.nytimes.com", "www.speedtest.net",
+    # These are deliberately diversified, public TLS endpoints.  The central
+    # block-list check decides which of the locally suitable results may be
+    # recommended for use from Russia.
+    "security.ubuntu.com", "packages.ubuntu.com", "archive.ubuntu.com",
+    "www.debian.org", "www.freebsd.org", "www.openbsd.org", "www.archlinux.org",
+    "www.opensuse.org", "download.opensuse.org", "www.postgresql.org",
+    "www.gnu.org", "www.europa.eu",
 )
 
 # HTTP alone cannot prove that an account can use an AI service. A CDN or an
@@ -663,13 +670,22 @@ def _reality_tls_audit() -> dict:
         (probe for probe in probes if probe.get("feasible")),
         key=lambda probe: (int(probe.get("ms") or 999999), str(probe.get("domain") or "")),
     )
+    rejection_summary: dict[str, int] = {}
+    for probe in probes:
+        if probe.get("feasible"):
+            continue
+        reason = str(probe.get("error") or f"{probe.get('tls') or 'no TLS'} / {probe.get('alpn') or 'no ALPN'}")[:80]
+        rejection_summary[reason] = rejection_summary.get(reason, 0) + 1
     return {
         "ok": True,
         "kind": "reality_tls_audit",
         "public_ipv4": _public_ipv4(),
         "tested": len(probes),
-        "feasible": feasible[:12],
+        # The panel checks the public block-list centrally and needs more than
+        # ten candidates so a CDN-range match does not leave an empty result.
+        "feasible": feasible[:30],
         "rejected": len(probes) - len(feasible),
+        "rejection_summary": rejection_summary,
         "duration_ms": round((time.monotonic() - started) * 1000),
         "safety": {
             "manual_only": True,
