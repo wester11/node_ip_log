@@ -18,7 +18,7 @@ from typing import Awaitable, Callable
 import requests
 
 
-AGENT_VERSION = "2.1.2"
+AGENT_VERSION = "2.1.3"
 IDENTITY_FILE = Path(os.getenv("VOID_NODE_IDENTITY_FILE", "/var/lib/void-node-agent/identity.json"))
 CENTRAL_API_URL = os.getenv("CENTRAL_API_URL", "https://netvoid.ru").rstrip("/")
 _SESSION = requests.Session()

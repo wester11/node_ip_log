@@ -29,9 +29,11 @@ import json
 import os
 import shutil
 import socket
+import ssl
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -61,6 +63,19 @@ AUDIT_ENDPOINTS = (
     ("google_ai_api", "https://generativelanguage.googleapis.com/", {400, 401, 403, 404, 429}),
     ("youtube", "https://www.youtube.com/", {200, 302, 303, 401, 403, 429}),
     ("youtube_premium", "https://www.youtube.com/premium", {200, 302, 303, 401, 403, 429}),
+)
+
+# Bounded, source-controlled candidates for REALITY.  This deliberately uses
+# RealiTLScanner's useful eligibility test (TLS 1.3 + ALPN h2), but never its
+# broad IP/CIDR scanning mode: the upstream project warns that cloud scanning
+# can get a VPS flagged.  The control plane cannot add hosts or arguments.
+REALITY_TLS_CANDIDATES = (
+    "www.apple.com", "www.microsoft.com", "www.bing.com", "www.mozilla.org",
+    "www.cloudflare.com", "www.wikipedia.org", "www.kernel.org", "www.gnu.org",
+    "www.debian.org", "www.ubuntu.com", "www.fedoraproject.org", "www.redhat.com",
+    "www.oracle.com", "www.ibm.com", "www.cisco.com", "www.intel.com",
+    "www.nvidia.com", "www.dell.com", "www.adobe.com", "www.samsung.com",
+    "www.nike.com", "www.bbc.com", "www.nytimes.com", "www.speedtest.net",
 )
 
 # HTTP alone cannot prove that an account can use an AI service. A CDN or an
@@ -598,6 +613,72 @@ def _public_ipv4() -> str:
         return ""
 
 
+def _reality_tls_probe(host: str) -> dict:
+    """Perform one small REALITY suitability check without HTTP requests.
+
+    It intentionally mirrors the safe part of RealiTLScanner: a TLS handshake
+    with SNI and ALPN, accepting only TLS 1.3 + HTTP/2.  We keep this bounded
+    to fixed domains, one IPv4 address and a three-second timeout.
+    """
+    started = time.monotonic()
+    try:
+        records = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+        address = records[0][4][0]
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.set_alpn_protocols(["h2", "http/1.1"])
+        with socket.create_connection((address, 443), timeout=3) as raw_socket:
+            with context.wrap_socket(raw_socket, server_hostname=host) as tls_socket:
+                version = str(tls_socket.version() or "")
+                alpn = str(tls_socket.selected_alpn_protocol() or "")
+                cert_present = bool(tls_socket.getpeercert(binary_form=True))
+        return {
+            "domain": host,
+            "ip": address,
+            "feasible": version == "TLSv1.3" and alpn == "h2" and cert_present,
+            "tls": version,
+            "alpn": alpn,
+            "ms": round((time.monotonic() - started) * 1000),
+        }
+    except (OSError, ssl.SSLError, ValueError) as error:
+        return {
+            "domain": host,
+            "feasible": False,
+            "error": error.__class__.__name__,
+            "ms": round((time.monotonic() - started) * 1000),
+        }
+
+
+def _reality_tls_audit() -> dict:
+    """Manual, low-impact candidate selection for REALITY server names."""
+    started = time.monotonic()
+    probes: list[dict] = []
+    # Three workers means at most three short outbound TLS handshakes at once.
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="void-tls") as executor:
+        futures = [executor.submit(_reality_tls_probe, host) for host in REALITY_TLS_CANDIDATES]
+        for future in as_completed(futures):
+            probes.append(future.result())
+    feasible = sorted(
+        (probe for probe in probes if probe.get("feasible")),
+        key=lambda probe: (int(probe.get("ms") or 999999), str(probe.get("domain") or "")),
+    )
+    return {
+        "ok": True,
+        "kind": "reality_tls_audit",
+        "public_ipv4": _public_ipv4(),
+        "tested": len(probes),
+        "feasible": feasible[:12],
+        "rejected": len(probes) - len(feasible),
+        "duration_ms": round((time.monotonic() - started) * 1000),
+        "safety": {
+            "manual_only": True,
+            "parallel_connections": 3,
+            "scope": "fixed_domain_list",
+        },
+    }
+
+
 def _compact_geocheck_report() -> dict:
     """Run the checksum-pinned local binary and return a bounded JSON summary."""
     if not os.path.isfile(GEOCHECK_BIN) or not os.access(GEOCHECK_BIN, os.X_OK):
@@ -838,6 +919,10 @@ async def execute_secure_command(action: str, payload: dict) -> dict:
         # command line, proxy or shell fragment to this privileged service.
         profile = str(payload.get("profile") or "quick")
         return await asyncio.to_thread(_network_audit, profile)
+    if action == "reality_tls_audit":
+        # No central payload is accepted: this is a bounded manual test of the
+        # fixed source list above, never a remote scanner or shell.
+        return await asyncio.to_thread(_reality_tls_audit)
     raise ValueError("unsupported command")
 
 
