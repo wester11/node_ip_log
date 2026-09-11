@@ -83,6 +83,10 @@ REALITY_TLS_CANDIDATES = (
     "www.debian.org", "www.freebsd.org", "www.openbsd.org", "www.archlinux.org",
     "www.opensuse.org", "download.opensuse.org", "www.postgresql.org",
     "www.gnu.org", "www.europa.eu",
+    # Candidates explicitly supplied by an infrastructure provider for a
+    # supported migration. They remain part of the same bounded manual audit:
+    # no customer input can add arbitrary scan targets.
+    "alpinestars.com", "zentrale-pruefstelle-praevention.de", "blackvision.co.uk",
 )
 
 # HTTP alone cannot prove that an account can use an AI service. A CDN or an
